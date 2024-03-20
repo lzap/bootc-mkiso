@@ -1,0 +1,147 @@
+#!/bin/bash
+set -xe
+SCRIPT=$(basename $0)
+
+usage() {
+    echo "Usage: $SCRIPT <os-netboot.iso> <new.iso> <registry/repository:tag>"
+}
+
+if [[ $# -ne 3 ]]; then
+	usage
+	exit 1
+fi
+
+TROOT=$(mktemp -d /tmp/$SCRIPT-troot-XXXXXXX)
+TAUX=$(mktemp -d /tmp/$SCRIPT-taux-XXXXXXX)
+trap "rm -rf $TROOT $TAUX" EXIT
+
+PCGRUBDIR=/usr/lib/grub/i386-pc
+ARG_IN_ISO="$1"
+ARG_OUT_ISO="$2"
+ARG_URL="$3"
+
+if [[ -e "$ARG_OUT_ISO" ]]; then
+	echo "$ARG_OUT_ISO already exists"
+	exit 1
+fi
+
+# extract source ISO
+xorriso -osirrox on -indev "$ARG_IN_ISO" -extract / "$TROOT"
+
+find $TROOT
+
+# detect legacy (isolinux) build or modern (grub2 only)
+if [[ -e $TROOT/isolinux/isolinux.bin ]]; then
+	LEGACY=1
+else
+	LEGACY=0
+fi
+
+if [[ $LEGACY -eq 0 ]]; then
+cat >$TROOT/boot/grub2/grub.cfg <<EOBIOS
+function load_video {
+  insmod all_video
+}
+load_video
+set gfxpayload=keep
+insmod gzio
+insmod part_gpt
+insmod ext2
+insmod chain
+search --no-floppy --set=root -l 'BOOTC_ISO'
+linux /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=BOOTC_ISO inst.ks=cdrom:/ks.cfg
+initrd /images/pxeboot/initrd.img
+boot
+EOBIOS
+else
+cat >$TROOT/isolinux/isolinux.cfg <<EOBIOS
+default install
+timeout 100
+label install
+menu label ^Install
+kernel /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=BOOTC_ISO inst.ks=cdrom:/ks.cfg
+append initrd=/images/pxeboot/initrd.img
+EOBIOS
+fi
+
+cat >$TROOT/EFI/BOOT/grub.cfg <<EOEFI
+function load_video {
+  insmod efi_gop
+  insmod efi_uga
+  insmod video_bochs
+  insmod video_cirrus
+  insmod all_video
+}
+load_video
+set gfxpayload=keep
+insmod gzio
+insmod part_gpt
+insmod ext2
+search --no-floppy --set=root -l 'BOOTC_ISO'
+linuxefi /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=BOOTC_ISO inst.ks=cdrom:/ks.cfg
+initrdefi /images/pxeboot/initrd.img
+boot
+EOEFI
+
+cat >$TROOT/ks.cfg <<EOKS
+ostreecontainer --url=$ARG_URL --no-signature-verification --transport=registry
+
+text
+network --bootproto=dhcp
+rootpw --lock
+clearpart --all
+autopart --nohome
+bootloader
+poweroff
+EOKS
+
+truncate -s 8M $TAUX/efiboot.img
+mkfs.vfat $TAUX/efiboot.img
+mmd -i $TAUX/efiboot.img ::/EFI ::/EFI/BOOT ::/EFI/BOOT/fonts
+mcopy -i $TAUX/efiboot.img $TROOT/EFI/BOOT/BOOTX64.EFI ::EFI/BOOT
+mcopy -i $TAUX/efiboot.img $TROOT/EFI/BOOT/grubx64.efi ::EFI/BOOT
+mcopy -i $TAUX/efiboot.img $TROOT/EFI/BOOT/fonts/unicode.pf2 ::EFI/BOOT/fonts
+mcopy -i $TAUX/efiboot.img $TROOT/EFI/BOOT/grub.cfg ::EFI/BOOT
+
+grub2-mkimage -v -O i386-pc-eltorito -d /usr/lib/grub/i386-pc \
+  -o $TROOT/images/eltorito.img \
+  -p /boot/grub2 \
+  iso9660 biosdisk
+
+if [[ $LEGACY -eq 0 ]]; then
+	# grub2 only ISO: xorriso from 2022 or later required
+	xorrisofs -o $ARG_OUT_ISO \
+	  -R -J -V 'BOOTC_ISO' \
+	  --grub2-mbr $PCGRUBDIR/boot_hybrid.img \
+	  -partition_offset 16 \
+	  -appended_part_as_gpt \
+	  -append_partition 2 C12A7328-F81F-11D2-BA4B-00A0C93EC93B $TAUX/efiboot.img \
+	  -iso_mbr_part_type EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 \
+	  -c boot.cat --boot-catalog-hide \
+	  -b images/eltorito.img \
+	  -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info \
+	  -eltorito-alt-boot \
+	  -e '--interval:appended_partition_2:all::' -no-emul-boot \
+	  -graft-points \
+	  $TROOT
+
+	if [[ $? -ne 0 ]]; then
+		echo "Too old version of xorrisofs, creating EFI-only ISO file."
+		echo "To create hybrid BIOS+EFI, upgrade xorrisofs to the latest version."
+		xorrisofs -o $ARG_OUT_ISO \
+		  -R -J -V 'BOOTC_ISO' \
+		  -isohybrid-mbr /usr/share/syslinux/isohdpfx.bin \
+		  -boot-load-size 4 -boot-info-table -no-emul-boot \
+		  -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
+		  -b isolinux.bin -c boot.cat \
+		  -graft-points \
+		  $TROOT \
+		  images/efiboot.img=$TAUX/efiboot.img \
+		  isolinux.bin=/usr/share/syslinux/isolinux.bin
+	fi
+else
+	# isolinux + grub2: https://access.redhat.com/solutions/60959
+	mkisofs -o $ARG_OUT_ISO -b isolinux/isolinux.bin -J -R -l -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e images/efiboot.img -no-emul-boot -graft-points -joliet-long -V "BOOTC_ISO" $TROOT
+fi
+
+exit 0
